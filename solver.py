@@ -118,6 +118,7 @@ class Solver:
         for iter in range(1, n_iters + 1):
             training_pair = training_pairs[iter - 1]
             input_variable = training_pair[0]
+            print("input_variable = "+str(input_variable))
             target_variable = training_pair[1]
 
             loss = self.train(input_variable, target_variable, encoder,

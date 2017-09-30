@@ -28,6 +28,7 @@ class EncoderRNN(nn.Module):
         self.gru = nn.GRU(hidden_size, hidden_size)
 
     def forward(self, input, hidden):
+        #print("forward: " + str(input.data.shape))
         embedded = self.embedding(input).view(1, 1, -1)
         output = embedded
         for i in range(self.n_layers):
@@ -56,6 +57,8 @@ class DecoderRNN(nn.Module):
 
     def forward(self, input, hidden):
         output = self.embedding(input).view(1, 1, -1)
+        print("forward: " + str(output.data.shape))
+        print("forward: " + str(self.embedding(input).data.shape))
         for i in range(self.n_layers):
             output = F.relu(output)
             output, hidden = self.gru(output, hidden)
@@ -89,11 +92,21 @@ class AttnDecoderRNN(nn.Module):
     def forward(self, input, hidden, encoder_output, encoder_outputs):
         embedded = self.embedding(input).view(1, 1, -1)
         embedded = self.dropout(embedded)
+        print("========================")
+
+        print("input: " + str(input.data.shape))
+        print("forward emb: " + str(embedded.data.shape))
+        print("forward: " + str(self.embedding(input).data.size()))
+        print("encoder_outputs: " + str(encoder_outputs.data.size()))
+      
 
         attn_weights = F.softmax(
             self.attn(torch.cat((embedded[0], hidden[0]), 1)))
+        print("attn_weights: " + str(attn_weights.data.size()))        
         attn_applied = torch.bmm(attn_weights.unsqueeze(0),
                                  encoder_outputs.unsqueeze(0))
+        print("attn_applied: " + str(attn_applied.data.size()))        
+
 
         output = torch.cat((embedded[0], attn_applied[0]), 1)
         output = self.attn_combine(output).unsqueeze(0)
