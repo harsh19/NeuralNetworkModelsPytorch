@@ -6,7 +6,6 @@ import re
 import random
 
 import numpy as np
-import configuration as config
 import pickle
 import json
 

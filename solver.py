@@ -7,7 +7,6 @@ import re
 import random
 
 import numpy as np
-import configuration as config
 import pickle
 import json
 import time
@@ -22,6 +21,8 @@ import torch.nn.functional as F
 import prepro
 from models import EncoderRNN
 from models import AttnDecoderRNN
+
+print("cuda available: " + str(torch.cuda.is_available()) )
 
 class Solver:
 
@@ -127,7 +128,7 @@ class Solver:
             if iter % print_every == 0:
                 print_loss_avg = print_loss_total / print_every
                 print_loss_total = 0
-                print('%s (%d %d%%) %.4f' % (timeSince(start, iter / n_iters),
+                print('%s (%d %d%%) %.4f' % (self.timeSince(start, iter / n_iters),
                                              iter, iter / n_iters * 100, print_loss_avg))
 
             if iter % plot_every == 0:
