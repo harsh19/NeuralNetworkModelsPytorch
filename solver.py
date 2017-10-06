@@ -17,102 +17,113 @@ from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
 import pickle
+import matplotlib.pyplot as plt
+from matplotlib import ticker
 
 import prepro
 from models import EncoderRNN
 from models import AttnDecoderRNN
+import utilities
+import models
 
 print("cuda available: " + str(torch.cuda.is_available()) )
 
 class Solver:
 
-    def __init__(self):
+    def __init__(self, params):
         self.SOS_token = 0
         self.EOS_token = 1
         self.use_cuda = torch.cuda.is_available()
-        self.teacher_forcing_ratio = 0.5
+        self.params = params
+        self.teacher_forcing_ratio = params.teacher_forcing_ratio
 
+    def performStep(self, input_variable, target_variable, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, max_target_length, mode="train"):
 
-    def train(self, input_variable, target_variable, encoder, decoder, encoder_optimizer, decoder_optimizer, criterion, max_length):
-
-        encoder_optimizer.zero_grad()
-        decoder_optimizer.zero_grad()
+        if mode=="train":
+            encoder_optimizer.zero_grad()
+            decoder_optimizer.zero_grad()
 
         batch_size = input_variable.size()[0]
         input_length = input_variable.size()[1]  # input -> b,m,1
-        target_length = target_variable.size()[1]
-        #print("input_variable.size()="+str(input_variable.size()))
+        if mode=="train":
+            target_length = target_variable.size()[1]
+        else:
+            target_length = max_target_length
 
         encoder_hidden = encoder.initHidden(batch_size) # 1,b,h
-        print("encoder_hidden.size()="+str(encoder_hidden.size()))
-        encoder_outputs = Variable(torch.zeros(max_length, batch_size, encoder.hidden_size))
+        encoder_outputs = Variable(torch.zeros(input_length, batch_size, encoder.hidden_size))
         encoder_outputs = encoder_outputs.cuda() if self.use_cuda else encoder_outputs
 
         loss = 0
 
+        #print("::: ",input_variable.size())
         for ei in range(input_length):
             inp = input_variable[:,ei,:] # b,1
-            print("inp.size()="+str(inp.size()))
             encoder_output, encoder_hidden = encoder(
                 inp, encoder_hidden)
-            print("encoder_output.size()="+str(encoder_output.size()))
             encoder_outputs[ei] = encoder_output[0]
-        print("encoder_outputs.size()="+str(encoder_outputs.size()))
-        print("="*66)
-
-        decoder_input = Variable(torch.LongTensor([[self.SOS_token]*5]))
+        decoder_input = Variable(torch.LongTensor([[self.SOS_token]*batch_size]))
         decoder_input = decoder_input.cuda() if self.use_cuda else decoder_input
-
+        
         decoder_hidden = encoder_hidden # can also use last encoder output
 
-        use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
-        use_teacher_forcing = True
+        if mode=="train":
+            use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False
+        else:
+            use_teacher_forcing = False
+        if mode=="train":
+            target_variable = target_variable.squeeze(2) # b,m  . #target_variable: b,m,1
 
         if use_teacher_forcing:
             # Teacher forcing: Feed the target as the next input
             for di in range(target_length):
                 decoder_output, decoder_hidden, decoder_attention = decoder(
                     decoder_input, decoder_hidden, encoder_output, encoder_outputs)
-                loss += criterion(decoder_output, target_variable[di])
-                decoder_input = target_variable[di]  # Teacher forcing
+                if mode=="train":
+                    cur_batch_loss = (criterion(decoder_output, target_variable[:,di]))/(1.0*batch_size) 
+                    loss += cur_batch_loss
+                    #print(cur_batch_loss)
+                decoder_input = target_variable[:,di].unsqueeze(0)  # Teacher forcing b -> 1,b
 
-        else:
-            # Without teacher forcing: use its own predictions as the next input
+        else: # Without teacher forcing: use its own predictions as the next input
+            
+            eos_vals = [0]*batch_size
+            if mode=="inference":
+                ret = []
+                ret_attention = []
             for di in range(target_length):
                 decoder_output, decoder_hidden, decoder_attention = decoder(
                     decoder_input, decoder_hidden, encoder_output, encoder_outputs)
-                topv, topi = decoder_output.data.topk(1)
-                ni = topi[0][0]
-
-                decoder_input = Variable(torch.LongTensor([[ni]]))
+                ni_vals = []
+                for i,output in enumerate(decoder_output):
+                    topv, topi = output.data.topk(1)
+                    ni = topi[0] # greedy decoding
+                    ni_vals.append(ni)
+                    if ni==self.EOS_token:
+                        eos_vals[i] = 1
+                if mode=="inference":
+                    ret.append(ni_vals)
+                    ret_attention.append(decoder_attention.data.numpy())
+                decoder_input = Variable(torch.LongTensor([ni_vals]))
                 decoder_input = decoder_input.cuda() if self.use_cuda else decoder_input
 
-                loss += criterion(decoder_output, target_variable[di])
-                if ni == self.EOS_token:
+                if mode=="train":
+                    den = sum( target_variable[:,di] == 0 )
+                    cur_batch_loss = (criterion(decoder_output, target_variable[:,di]))/( 1.0*(batch_size) ) 
+                    loss += cur_batch_loss
+                if sum(ni_vals)==batch_size: ## All have reached EOS
                     break
 
-        loss.backward()
-
-        encoder_optimizer.step()
-        decoder_optimizer.step()
-
-        return loss.data[0] / target_length
-
-    def asMinutes(self, s):
-        m = math.floor(s / 60)
-        s -= m * 60
-        return '%dm %ds' % (m, s)
+        if mode=="train":
+            loss.backward()
+            encoder_optimizer.step()
+            decoder_optimizer.step()
+            return loss.data[0]
+        else:
+            return ret, ret_attention
 
 
-    def timeSince(self, since, percent):
-        now = time.time()
-        s = now - since
-        es = s / (percent)
-        rs = es - s
-        return '%s (- %s)' % (self.asMinutes(s), self.asMinutes(rs))
-
-
-    def trainIters(self, encoder, decoder, n_iters, print_every=1000, plot_every=100, learning_rate=0.01):
+    def train(self, training_pairs, criterion, encoder, decoder, print_every=1000, plot_every=100, learning_rate=0.1, shuffle_batches=True):
         start = time.time()
         plot_losses = []
         print_loss_total = 0  # Reset every print_every
@@ -120,244 +131,206 @@ class Solver:
 
         encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
         decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
-        #training_pairs = [ self.data_preparer.variablesFromPair(random.choice(self.data_preparer.pairs))
-        #                  for i in range(n_iters)]
-        training_pairs = [ self.data_preparer.variablesFromPairs( [random.choice(self.data_preparer.pairs)]*5 )
-                          for i in range(n_iters)]                          
-        criterion = nn.NLLLoss()
 
-        for iter in range(1, n_iters + 1):
-            training_pair = training_pairs[iter - 1]
+        evaluate_every = 10
+
+        num_batches = len(training_pairs)
+        batch_indices = np.arange(num_batches)
+        if shuffle_batches:
+            np.random.shuffle( batch_indices )
+        for iter in range(1, num_batches + 1):
+            batch_num = batch_indices[iter-1]
+            training_pair = training_pairs[batch_num]
             input_variable = training_pair[0]
             target_variable = training_pair[1]
-            print("input_variable = "+str(input_variable))
+            #print("input_variable = "+str(input_variable.data.size()))
 
-            loss = self.train(input_variable, target_variable, encoder,
-                         decoder, encoder_optimizer, decoder_optimizer, criterion, self.MAX_LENGTH)
+            loss = self.performStep(input_variable, target_variable, encoder,
+                         decoder, encoder_optimizer, decoder_optimizer, criterion, self.MAX_LENGTH, mode="train")
             print_loss_total += loss
             plot_loss_total += loss
 
             if iter % print_every == 0:
                 print_loss_avg = print_loss_total / print_every
                 print_loss_total = 0
-                print('%s (%d %d%%) %.4f' % (self.timeSince(start, iter / n_iters),
-                                             iter, iter / n_iters * 100, print_loss_avg))
+                print('%s (%d %d%%) %.4f' % (utilities.timeSince(start, iter / num_batches),
+                                             iter, iter / num_batches * 100, print_loss_avg))
 
             if iter % plot_every == 0:
                 plot_loss_avg = plot_loss_total / plot_every
                 plot_losses.append(plot_loss_avg)
                 plot_loss_total = 0
 
-        self.showPlot(plot_losses)
-
-
-    def showPlot(self, points):
-        plt.figure()
-        fig, ax = plt.subplots()
-        # this locator puts ticks at regular intervals
-        loc = ticker.MultipleLocator(base=0.2)
-        ax.yaxis.set_major_locator(loc)
-        plt.plot(points)
+        #utilities.showPlot(plot_losses)
 
 
     ######################################################################
-    # Evaluation
     # ==========
-    #
-    # Evaluation is mostly the same as training, but there are no targets so
-    # we simply feed the decoder's predictions back to itself for each step.
-    # Every time it predicts a word we add it to the output string, and if it
-    # predicts the EOS token we stop there. We also store the decoder's
-    # attention outputs for display later.
-    #
+   
 
-    def evaluate(self, encoder, decoder, sentence, max_length):
-        input_variable = variableFromSentence(input_lang, sentence)
-        input_length = input_variable.size()[0]
-        encoder_hidden = encoder.initHidden()
+    def decode(self, encoder, decoder, sentences, max_length):
+        decoded_words_all = []
+        attentions_numpy_all = []
 
-        encoder_outputs = Variable(torch.zeros(max_length, encoder.hidden_size))
-        encoder_outputs = encoder_outputs.cuda() if self.use_cuda else encoder_outputs
-
-        for ei in range(input_length):
-            encoder_output, encoder_hidden = encoder(input_variable[ei],
-                                                     encoder_hidden)
-            encoder_outputs[ei] = encoder_outputs[ei] + encoder_output[0][0]
-
-        decoder_input = Variable(torch.LongTensor([[self.SOS_token]]))  # SOS
-        decoder_input = decoder_input.cuda() if self.use_cuda else decoder_input
-
-        decoder_hidden = encoder_hidden
-
-        decoded_words = []
-        decoder_attentions = torch.zeros(max_length, max_length)
-
-        for di in range(max_length):
-            decoder_output, decoder_hidden, decoder_attention = decoder(
-                decoder_input, decoder_hidden, encoder_output, encoder_outputs)
-            decoder_attentions[di] = decoder_attention.data
-            topv, topi = decoder_output.data.topk(1)
-            ni = topi[0][0]
-            if ni == self.EOS_token:
-                decoded_words.append('<EOS>')
-                break
-            else:
-                decoded_words.append(output_lang.index2word[ni])
+        for sentence in sentences:
+            #print("sentence = "+sentence)
+            input_lang, output_lang, pairs = self.data_preparer.input_lang, self.data_preparer.output_lang, \
+                    self.data_preparer.pairs
+            #input_variable = variableFromSentence(input_lang, sentence)
+            inputs = self.data_preparer.variableFromSentence( self.data_preparer.input_lang, sentence )
+            inputs = inputs.view(1,-1,1)
+            batch_size = 1
+            input_variable = inputs
+            outputs, outputs_attention = self.performStep(input_variable, None, encoder,
+                             decoder, None, None, None, self.MAX_LENGTH, mode="inference")
+            # outputs_attention: m_out, b, m_in
+            decoded_words = []
+            for b in range(batch_size): decoded_words.append([])
+            j=0
+            for outputs_at_idx in outputs:
+                for idx,output in enumerate(outputs_at_idx):
+                    decoded_words[idx].append( output_lang.index2word[output] )
+                j+=1
+            # decoded_words -> b,mout
+            #print("decoded_words= "+str(decoded_words))
+            attentions_numpy = np.array(outputs_attention) #.data.numpy() # mout, b, min
+            attentions_numpy = np.transpose(attentions_numpy, [1,0,2] ) # mout, b, min -> b,mout,min
             
-            decoder_input = Variable(torch.LongTensor([[ni]]))
-            decoder_input = decoder_input.cuda() if self.use_cuda else decoder_input
+            # AS of current implelmentation, bnatch size is 1
+            decoded_words_all.append(decoded_words[0])
+            attentions_numpy_all.append(attentions_numpy[0])
 
-        return decoded_words, decoder_attentions[:di + 1]
+        return decoded_words_all, attentions_numpy_all
 
+
+    def computeAndEvaluateBleu(self, model, data_pairs):
+        encoder, decoder = model[0], model[1]
+        max_out_length = 20
+        sentences = []
+        data = data_pairs  #[:10] # change to validation_pairs
+        inputs = []
+        outputs = []
+        for pair in data_pairs:
+            inputs.append(pair[0])
+            outputs.append(pair[1])
+        pred_outputs, attentions = self.decode(encoder, decoder, [pair[0]], max_length=10)
+        pred_outputs = [' '.join(output_words) for output_words in pred_outputs]
+        bleu = utilities.evaluateBleu(pred_outputs, outputs)
+        print("BLEU = ", bleu)
 
     ######################################################################
-    # We can evaluate random sentences from the training set and print out the
-    # input, target, and output to make some subjective quality judgements:
-    #
 
-    def evaluateRandomly(self, encoder, decoder, n=10):
+    def evaluateRandomly(self, encoder, decoder, n=10, lim=-1, criterion=None):
         for i in range(n):
-            pair = random.choice(pairs)
-            print('>', pair[0])
-            print('=', pair[1])
-            output_words, attentions = evaluate(encoder, decoder, pair[0])
+            pair = random.choice(self.data_preparer.pairs[:lim])
+            print('> INPUT: ', pair[0])
+            print('= GROUND TRUTH OUTOUT: ', pair[1])
+            output_words, attentions = self.decode(encoder, decoder, [pair[0]], max_length=10)
+            output_words, attentions = output_words[0], attentions[0]
             output_sentence = ' '.join(output_words)
-            print('<', output_sentence)
+            print('< PREDICTED OUTPUT: ', output_sentence)
             print('')
 
 
-
-
-    ######################################################################
-    # For a better viewing experience we will do the extra work of adding axes
-    # and labels:
-    #
-
-    def showAttention(input_sentence, output_words, attentions):
-        # Set up figure with colorbar
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        cax = ax.matshow(attentions.numpy(), cmap='bone')
-        fig.colorbar(cax)
-
-        # Set up axes
-        ax.set_xticklabels([''] + input_sentence.split(' ') +
-                           ['<EOS>'], rotation=90)
-        ax.set_yticklabels([''] + output_words)
-
-        # Show label at every tick
-        ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
-        ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
-
-        plt.show()
-
-
-    def evaluateAndShowAttention(input_sentence):
-        output_words, attentions = evaluate(
-            encoder1, attn_decoder1, input_sentence)
+    def evaluateAndShowAttention(self, input_sentence, encoder1, attn_decoder1):
+        output_words, attentions = self.decode(
+            encoder1, attn_decoder1, [input_sentence], max_length=10)
+        output_words, attentions = output_words[0], attentions[0]
         print('input =', input_sentence)
         print('output =', ' '.join(output_words))
-        showAttention(input_sentence, output_words, attentions)
+        utilities.showAttention(input_sentence, output_words, attentions)
 
-    def main(self, mode):
+    ######################################################################
+
+
+    def main(self):
+
+        params = self.params
+        mode = params.mode
 
         ## prepro
         if mode=="prepro":
             self.data_preparer = data_preparer = prepro.Prepro()
             data_preparer.getData()
             pickle.dump(data_preparer, open(u'data_preparer.p','wb'))
-        else:
+        
+        elif mode=="train":
+            
             data_preparer = pickle.load( open(u'data_preparer.p','rb') )
             self.data_preparer = data_preparer
             input_lang, output_lang, pairs = data_preparer.input_lang, data_preparer.output_lang, \
                 data_preparer.pairs
-            print("="*50)
             self.MAX_LENGTH = data_preparer.MAX_LENGTH
-            print("="*50)
 
-            ######################################################################
-            # Training and Evaluating
-            # =======================
-            #
-            # With all these helper functions in place (it looks like extra work, but
-            # it's easier to run multiple experiments easier) we can actually
-            # initialize a network and start training.
-            #
-            # Remember that the input sentences were heavily filtered. For this small
-            # dataset we can use relatively small networks of 256 hidden nodes and a
-            # single GRU layer. After about 40 minutes on a MacBook CPU we'll get some
-            # reasonable results.
-            #
-            # .. Note:: 
-            #    If you run this notebook you can train, interrupt the kernel,
-            #    evaluate, and continue training later. Comment out the lines where the
-            #    encoder and decoder are initialized and run ``trainIters`` again.
-            #
-
-            hidden_size = 256
-            encoder1 = EncoderRNN(input_lang.n_words, hidden_size)
-            attn_decoder1 = AttnDecoderRNN(hidden_size, output_lang.n_words,
-                                           1, dropout_p=0.1, max_length=self.MAX_LENGTH)
-
+            hidden_size = params.hidden_size
+            embeddings_size = params.embeddings_size # not used as of now
+            model = models.Model(input_lang.n_words, output_lang.n_words, hidden_size)
+            encoder1, attn_decoder1 = model.encoder1, model.attn_decoder1
             if self.use_cuda:
                 encoder1 = encoder1.cuda()
                 attn_decoder1 = attn_decoder1.cuda()
 
-            self.trainIters(encoder1, attn_decoder1, 75000, print_every=5000)
+            epochs = params.epochs
+            num_of_data_points = params.num_of_points #9600
+            print("POINTS BEING USED FOR TRAINING / TOTAL DATA POINTS",num_of_data_points, len(self.data_preparer.pairs))
+            batch_size = params.batch_size
+            save_every = params.save_every_epoch
 
-            ######################################################################
-            #
+            training_pairs = []
+            num_batches = int(num_of_data_points / batch_size)
+            for i in range(num_batches):
+                cur_batch_data = self.data_preparer.pairs[i*batch_size:(i+1)*batch_size]
+                training_pairs.append( self.data_preparer.variablesFromPairs( cur_batch_data, padding=True ) )
+            
+            criterion = nn.NLLLoss(ignore_index=0)
 
-            self.evaluateRandomly(encoder1, attn_decoder1)
+            for epoch in range(epochs):
+                print("*"*99)
+                print("Epoch="+str(epoch))
+                self.train(training_pairs, criterion, encoder1, attn_decoder1, print_every=10)
+                self.evaluateRandomly(encoder1, attn_decoder1, n=5, criterion=criterion)
+                self.computeAndEvaluateBleu( [encoder1, attn_decoder1], self.data_preparer.pairs[:20])
+                if epoch%save_every==0:
+                    fname = "./tmp/saved_model_" + str(epoch)
+                    fname = fname.decode('utf-8')
+                    torch.save( {'encoder':encoder1.state_dict(), 'decoder':attn_decoder1.state_dict()} , fname )
 
+        elif mode=="test":
 
-            ######################################################################
-            # Visualizing Attention
-            # ---------------------
-            #
-            # A useful property of the attention mechanism is its highly interpretable
-            # outputs. Because it is used to weight specific encoder outputs of the
-            # input sequence, we can imagine looking where the network is focused most
-            # at each time step.
-            #
-            # You could simply run ``plt.matshow(attentions)`` to see attention output
-            # displayed as a matrix, with the columns being input steps and rows being
-            # output steps:
-            #
+            data_preparer = pickle.load( open(u'data_preparer.p','rb') )
+            self.data_preparer = data_preparer
+            input_lang, output_lang, pairs = data_preparer.input_lang, data_preparer.output_lang, \
+                data_preparer.pairs
+            self.MAX_LENGTH = data_preparer.MAX_LENGTH
 
-            output_words, attentions = self.evaluate(
-                encoder1, attn_decoder1, "je suis trop froid .")
-            plt.matshow(attentions.numpy())
+            hidden_size = params.hidden_size
+            embeddings_size = params.embeddings_size # not used as of now
+            model = models.Model(input_lang.n_words, output_lang.n_words, hidden_size)
+            encoder1, attn_decoder1 = model.encoder1, model.attn_decoder1
+            if self.use_cuda:
+                encoder1 = encoder1.cuda()
+                attn_decoder1 = attn_decoder1.cuda()
 
-            self.evaluateAndShowAttention("elle a cinq ans de moins que moi .")
+            # Load saved model
+            fname = "./tmp/saved_model_" + str(2)
+            fname = fname.decode('utf-8')
+            loaded_model = torch.load( fname )
+            encoder1.load_state_dict( loaded_model['encoder'] )
+            attn_decoder1.load_state_dict( loaded_model['decoder'] )
 
-            self.evaluateAndShowAttention("elle est trop petit .")
+            # bleu on test data  
 
-            self.evaluateAndShowAttention("je ne crains pas de mourir .")
+            # attention on test data         
+            output_words, attentions = self.decode(
+            encoder1, attn_decoder1, ["je suis trop froid ."], max_length=10)
+            output_words, attentions = output_words[0], attentions[0]
+            plt.matshow(attentions)
 
-            self.evaluateAndShowAttention("c est un jeune directeur plein de talent .")
+            self.evaluateAndShowAttention("elle a cinq ans de moins que moi .", encoder1, attn_decoder1)
+            self.evaluateAndShowAttention("elle est trop petit .", encoder1, attn_decoder1)
+            self.evaluateAndShowAttention("je ne crains pas de mourir .", encoder1, attn_decoder1)
+            self.evaluateAndShowAttention("c est un jeune directeur plein de talent .", encoder1, attn_decoder1)         
 
+        else:
 
-            ######################################################################
-            # Exercises
-            # =========
-            #
-            # -  Try with a different dataset
-            #
-            #    -  Another language pair
-            #    -  Human → Machine (e.g. IOT commands)
-            #    -  Chat → Response
-            #    -  Question → Answer
-            #
-            # -  Replace the embeddings with pre-trained word embeddings such as word2vec or
-            #    GloVe
-            # -  Try with more layers, more hidden units, and more sentences. Compare
-            #    the training time and results.
-            # -  If you use a translation file where pairs have two of the same phrase
-            #    (``I am test \t I am test``), you can use this as an autoencoder. Try
-            #    this:
-            #
-            #    -  Train as an autoencoder
-            #    -  Save only the Encoder network
-            #    -  Train a new Decoder for translation from there
-            #
+            print("INVALID MODE SELETED")

@@ -14,19 +14,22 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
+from keras.preprocessing.sequence import pad_sequences
 
 use_cuda = torch.cuda.is_available()
 
-SOS_token = 0
-EOS_token = 1
+SOS_token = 1
+EOS_token = 2
+pad_token = 0
+unk_token = 3
 
 class Lang:
 	def __init__(self, name):
 		self.name = name
 		self.word2index = {}
 		self.word2count = {}
-		self.index2word = {0: "SOS", 1: "EOS"}
-		self.n_words = 2  # Count SOS and EOS
+		self.index2word = {0: "PAD", 1: "SOS", 2:"EOS", 3:"UNK"}
+		self.n_words = 4  # Count SOS and EOS and PAD
 
 	def addSentence(self, sentence):
 		for word in sentence.split(' '):
@@ -117,7 +120,14 @@ class Prepro:
 
 
 	def indexesFromSentence(self, lang, sentence):
-		return [lang.word2index[word] for word in sentence.split(' ')]
+		ret = []
+		for word in sentence.split(' '):
+			#print("word = "+word)
+			if word in lang.word2index:
+				ret.append(lang.word2index[word] )
+			else:
+				ret.append(unk_token)
+		return ret
 
 
 	def variableFromSentence(self, lang, sentence):
@@ -129,6 +139,39 @@ class Prepro:
 		else:
 			return result
 
+	def variableFromSentenceBatch(self, lang, sentences, padding):
+		#print("padding:",padding)
+		#if padding=="post":
+		#	print(sentences)
+		all_indexes = []
+		batch_size = len(sentences)
+		max_len = -1
+		for sentence in sentences:
+			indexes = self.indexesFromSentence(lang, sentence)
+			indexes = indexes + [EOS_token]
+			max_len = max(max_len, len(indexes))
+		for sentence in sentences:
+			indexes = self.indexesFromSentence(lang, sentence)
+			indexes = indexes + [EOS_token]
+			if len(indexes)<max_len:
+				if padding=="post":
+					for j in range(max_len-len(indexes)):
+						indexes.append(0)
+					#print("post: ",indexes)
+				elif padding=="pre":
+					tmp = []
+					for j in range(max_len-len(indexes)):
+						tmp.append(0)
+					for val in indexes: 
+						tmp.append(val)
+					indexes = tmp
+					#print("pre: ",indexes)
+			all_indexes.append(indexes)
+		result = Variable(torch.LongTensor(all_indexes).view(batch_size, -1, 1))
+		if use_cuda:
+			return result.cuda()
+		else:
+			return result
 
 	def variablesFromPair(self, pair):
 		input_lang, output_lang, pairs = self.input_lang, self.output_lang, self.pairs
@@ -136,3 +179,16 @@ class Prepro:
 		target_variable = self.variableFromSentence(output_lang, pair[1])
 		return (input_variable, target_variable)
 
+	def variablesFromPairs(self, batch_pairs, padding):
+		input_lang, output_lang, pairs = self.input_lang, self.output_lang, self.pairs
+		inp=[]
+		out=[]
+		max_inp_length = -1
+		max_out_length = -1
+		for pair in batch_pairs:
+			inp.append(pair[0])
+			out.append(pair[1])
+		
+		input_variable = self.variableFromSentenceBatch(input_lang, inp, padding="pre")
+		target_variable = self.variableFromSentenceBatch(output_lang, out, padding="post")
+		return (input_variable, target_variable)
