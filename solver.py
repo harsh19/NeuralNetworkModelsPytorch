@@ -31,8 +31,8 @@ print("cuda available: " + str(torch.cuda.is_available()) )
 class Solver:
 
     def __init__(self, params):
-        self.SOS_token = 0
-        self.EOS_token = 1
+        self.SOS_token = 1
+        self.EOS_token = 2
         self.use_cuda = torch.cuda.is_available()
         self.params = params
         self.teacher_forcing_ratio = params.teacher_forcing_ratio
@@ -167,16 +167,15 @@ class Solver:
     ######################################################################
     # ==========
    
-
+    # TODO: This does one at a time as of now. Changing to batch should be simple
+    # TODO: Uses greedy decoding. Need beam search
     def decode(self, encoder, decoder, sentences, max_length):
         decoded_words_all = []
         attentions_numpy_all = []
 
         for sentence in sentences:
             #print("sentence = "+sentence)
-            input_lang, output_lang, pairs = self.data_preparer.input_lang, self.data_preparer.output_lang, \
-                    self.data_preparer.pairs
-            #input_variable = variableFromSentence(input_lang, sentence)
+            input_lang, output_lang = self.data_preparer.input_lang, self.data_preparer.output_lang
             inputs = self.data_preparer.variableFromSentence( self.data_preparer.input_lang, sentence )
             inputs = inputs.view(1,-1,1)
             batch_size = 1
@@ -189,6 +188,8 @@ class Solver:
             j=0
             for outputs_at_idx in outputs:
                 for idx,output in enumerate(outputs_at_idx):
+                    if output==2: #TODO: use language index to find out index of EOS token
+                        break
                     decoded_words[idx].append( output_lang.index2word[output] )
                 j+=1
             # decoded_words -> b,mout
@@ -196,7 +197,7 @@ class Solver:
             attentions_numpy = np.array(outputs_attention) #.data.numpy() # mout, b, min
             attentions_numpy = np.transpose(attentions_numpy, [1,0,2] ) # mout, b, min -> b,mout,min
             
-            # AS of current implelmentation, bnatch size is 1
+            # Since batch size is 1
             decoded_words_all.append(decoded_words[0])
             attentions_numpy_all.append(attentions_numpy[0])
 
@@ -213,8 +214,9 @@ class Solver:
         for pair in data_pairs:
             inputs.append(pair[0])
             outputs.append(pair[1])
-        pred_outputs, attentions = self.decode(encoder, decoder, [pair[0]], max_length=10)
+        pred_outputs, attentions = self.decode(encoder, decoder, inputs[:10], max_length=10)
         pred_outputs = [' '.join(output_words) for output_words in pred_outputs]
+        print(len(pred_outputs))
         bleu = utilities.evaluateBleu(pred_outputs, outputs)
         print("BLEU = ", bleu)
 
@@ -222,8 +224,8 @@ class Solver:
 
     def evaluateRandomly(self, encoder, decoder, n=10, lim=-1, criterion=None):
         for i in range(n):
-            pair = random.choice(self.data_preparer.pairs[:lim])
-            print('> INPUT: ', pair[0])
+            pair = random.choice(self.data_preparer.valid_pairs[:lim])
+            print('> INPUT (Random from validation): ', pair[0])
             print('= GROUND TRUTH OUTOUT: ', pair[1])
             output_words, attentions = self.decode(encoder, decoder, [pair[0]], max_length=10)
             output_words, attentions = output_words[0], attentions[0]
@@ -251,7 +253,7 @@ class Solver:
         ## prepro
         if mode=="prepro":
             self.data_preparer = data_preparer = prepro.Prepro()
-            data_preparer.getData()
+            data_preparer.getData(params.max_length)
             pickle.dump(data_preparer, open(u'data_preparer.p','wb'))
         
         elif mode=="train":
@@ -259,7 +261,7 @@ class Solver:
             data_preparer = pickle.load( open(u'data_preparer.p','rb') )
             self.data_preparer = data_preparer
             input_lang, output_lang, pairs = data_preparer.input_lang, data_preparer.output_lang, \
-                data_preparer.pairs
+                data_preparer.train_pairs
             self.MAX_LENGTH = data_preparer.MAX_LENGTH
 
             hidden_size = params.hidden_size
@@ -272,14 +274,16 @@ class Solver:
 
             epochs = params.epochs
             num_of_data_points = params.num_of_points #9600
-            print("POINTS BEING USED FOR TRAINING / TOTAL DATA POINTS",num_of_data_points, len(self.data_preparer.pairs))
+            if num_of_data_points==-1:
+                num_of_data_points = len(self.data_preparer.train_pairs)
+            print("POINTS BEING USED FOR TRAINING / TOTAL DATA POINTS",num_of_data_points, len(self.data_preparer.train_pairs))
             batch_size = params.batch_size
             save_every = params.save_every_epoch
 
             training_pairs = []
             num_batches = int(num_of_data_points / batch_size)
             for i in range(num_batches):
-                cur_batch_data = self.data_preparer.pairs[i*batch_size:(i+1)*batch_size]
+                cur_batch_data = self.data_preparer.train_pairs[i*batch_size:(i+1)*batch_size]
                 training_pairs.append( self.data_preparer.variablesFromPairs( cur_batch_data, padding=True ) )
             
             criterion = nn.NLLLoss(ignore_index=0)
@@ -289,7 +293,7 @@ class Solver:
                 print("Epoch="+str(epoch))
                 self.train(training_pairs, criterion, encoder1, attn_decoder1, print_every=10)
                 self.evaluateRandomly(encoder1, attn_decoder1, n=5, criterion=criterion)
-                self.computeAndEvaluateBleu( [encoder1, attn_decoder1], self.data_preparer.pairs[:20])
+                self.computeAndEvaluateBleu( [encoder1, attn_decoder1], self.data_preparer.valid_pairs)
                 if epoch%save_every==0:
                     fname = "./tmp/saved_model_" + str(epoch)
                     fname = fname.decode('utf-8')
@@ -300,7 +304,7 @@ class Solver:
             data_preparer = pickle.load( open(u'data_preparer.p','rb') )
             self.data_preparer = data_preparer
             input_lang, output_lang, pairs = data_preparer.input_lang, data_preparer.output_lang, \
-                data_preparer.pairs
+                data_preparer.test_pairs
             self.MAX_LENGTH = data_preparer.MAX_LENGTH
 
             hidden_size = params.hidden_size
