@@ -1,6 +1,6 @@
 import numpy as np
 import csv
-import configuration as config
+#import configuration as config
 import random
 import heapq
 import re
@@ -59,30 +59,30 @@ def timeSince(since, percent):
 
 
 def evaluateBleu(predicted_outputs, ground_truth_outputs):
-	pred_file_name = "./tmp/bleu_pred.txt"
-	pred_file = open(pred_file_name,"w")
-	gt_file_name = "./tmp/bleu_gt.txt"
-	gt_file = open(gt_file_name,"w")
-	for outputLine,groundLine in zip(predicted_outputs, ground_truth_outputs):
-		pred_file.write(outputLine + "\n")
-		gt_file.write(groundLine + "\n")
-	pred_file.close()
-	gt_file.close()
+    pred_file_name = "./tmp/bleu_pred.txt"
+    pred_file = open(pred_file_name,"w")
+    gt_file_name = "./tmp/bleu_gt.txt"
+    gt_file = open(gt_file_name,"w")
+    for outputLine,groundLine in zip(predicted_outputs, ground_truth_outputs):
+        pred_file.write(outputLine+"\n")
+        gt_file.write(groundLine+"\n")
+    pred_file.close()
+    gt_file.close()
 
-	BLEUOutput=os.popen("perl multi-bleu.perl -lc " + gt_file_name + " < " + pred_file_name).read()
-	return BLEUOutput
+    BLEUOutput=os.popen("perl multi-bleu.perl -lc " + gt_file_name + " < " + pred_file_name).read()
+    return BLEUOutput
 
 
 ################################################################
 
 def sampleFromDistribution(vals):
-		p = random.random()
-		s=0.0
-		for i,v in enumerate(vals):
-				s+=v
-				if s>=p:
-						return i
-		return len(vals)-1
+        p = random.random()
+        s=0.0
+        for i,v in enumerate(vals):
+                s+=v
+                if s>=p:
+                        return i
+        return len(vals)-1
 
 
 #############################################################
